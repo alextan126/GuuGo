@@ -6,7 +6,8 @@ counts, and surfaces the game result. All rules logic lives in the engine.
 
 We use pygame because it is a single pure-pip dependency (``pip install
 pygame``) with no system packages required, which makes the app trivial to
-ship to a grader: create a venv, install requirements, run ``main.py``.
+ship to a grader: ``pip install --user -r requirements.txt`` then
+``python main.py``. No virtualenvs needed.
 """
 
 from __future__ import annotations

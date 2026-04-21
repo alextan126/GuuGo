@@ -1,13 +1,50 @@
-# GuuGo dependencies. Install into a venv with:
-#     pip install -r requirements.txt
+# GuuGo Python dependencies.
 #
-# Runtime (beginner PvP app):
-pygame>=2.5
+# --------------------------------------------------------------------
+# Install (choose the path that matches what you're doing)
+# --------------------------------------------------------------------
+#
+# (1) PvP GUI on your laptop - no GPU, no training:
+#
+#       pip install --user -r requirements.txt
+#
+#     or, on a system that blocks system-wide pip (PEP 668):
+#
+#       pipx install pygame       # one-off
+#       python main.py
+#
+# (2) AlphaZero training on a Blackwell / DGX Spark box:
+#
+#     Do NOT create a venv. Use the NVIDIA NGC PyTorch container, which
+#     ships a torch build that knows about Blackwell (sm_100/sm_120).
+#     See the "Training" section of README.md and the Dockerfile at the
+#     repo root. Inside the container, only the lightweight deps below
+#     need to be installed - `torch` is already provided by NGC and must
+#     NOT be reinstalled (pip will happily replace it with a plain PyPI
+#     wheel that has no Blackwell kernels).
+#
+# --------------------------------------------------------------------
+# Runtime
+# --------------------------------------------------------------------
 
-# Dev / test:
+pygame>=2.5        # PvP GUI; not needed inside the training container
+numpy>=1.26        # encoding + MCTS math; provided by NGC but safe to pin
+
+# --------------------------------------------------------------------
+# Dev / test
+# --------------------------------------------------------------------
+
 pytest>=8.0
 
-# AlphaZero training stack. `torch` is a large download; if you only need
-# the PvP game you can skip this file and install just `pygame` + `pytest`.
-numpy>=1.26
-torch>=2.2
+# --------------------------------------------------------------------
+# NOT listed here on purpose
+# --------------------------------------------------------------------
+#
+#   torch   -> must come from the NGC container on Blackwell. On other
+#              machines, install it manually with a CUDA build that
+#              matches your GPU, e.g.
+#                pip install --user torch --index-url \
+#                    https://download.pytorch.org/whl/cu121
+#              or on CPU-only:
+#                pip install --user torch --index-url \
+#                    https://download.pytorch.org/whl/cpu

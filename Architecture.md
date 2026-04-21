@@ -245,14 +245,19 @@ The MVP targets a single workstation. Two levers let it scale:
   across MCTS nodes (and eventually across games).
 - **Stronger trainer.** The trainer is a single process today. On a
   DGX Spark / Blackwell node the path is:
-  - build a PyTorch container image (Nvidia's NGC PyTorch image is the
-    intended base; virtualenvs are not used on the cluster),
-  - move the model to `cuda` (or `bfloat16` + `torch.compile` for
-    Blackwell),
+  - run inside the NGC PyTorch container (see the `Dockerfile` at the
+    repo root). Virtualenvs are deliberately not used: the NGC image
+    ships a `torch` build compiled with Blackwell kernels
+    (`sm_100` / `sm_120`) and a plain `pip install torch` replaces it
+    with a stock wheel that has no such kernels,
+  - keep `--device cuda` (the default) so the trainer runs on GPU
+    while the CPU self-play workers keep it fed; optionally switch to
+    `bfloat16` + `torch.compile` for Blackwell once functional,
   - raise `batch_size`, `num_res_blocks`, and `num_channels` in the
     config,
-  - mount the shared `checkpoints/` and `replay/` directories that the
-    workers are also bind-mounted to.
+  - mount the shared `checkpoints/` and `replay/` directories with
+    `-v "$PWD":/workspace` so state survives container restarts and
+    can be rsync'd.
 
 Components that would need to change to support multi-node clusters:
 

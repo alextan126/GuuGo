@@ -11,24 +11,71 @@ same rules engine:
 The system architecture, data flow, and scaling path are documented
 separately in [`Architecture.md`](Architecture.md).
 
-## Requirements
+## Setup
 
-- Python 3.10+
-- `pip install -r requirements.txt` — installs:
-  - `pygame` for the PvP GUI,
-  - `numpy` and `torch` for the AlphaZero stack,
-  - `pytest` for tests.
+Two machines, two different installation stories. **No virtualenvs are
+used**: the PvP app uses a per-user pip install, and training uses the
+NVIDIA NGC PyTorch container directly (virtualenvs don't carry the
+right CUDA toolchain for Blackwell).
 
-If you only want the PvP app you can skip installing `torch`; the
-training imports are not loaded unless you actually run them.
-
-Fresh setup:
+### Laptop (PvP GUI)
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+pip install --user -r requirements.txt
+python main.py
 ```
+
+On systems that block system-wide pip (PEP 668, e.g. recent Debian /
+Ubuntu / Homebrew-managed Python), use `pipx install pygame` or add
+`--break-system-packages` to the pip invocation. `torch` is **not**
+needed for the PvP app; it is intentionally absent from
+`requirements.txt`.
+
+### Training box (Blackwell / DGX Spark)
+
+Training lives inside a Docker container built on NVIDIA's NGC
+PyTorch image. That image ships a `torch` wheel compiled with
+Blackwell kernels (`sm_100` / `sm_120`); stock PyPI wheels don't, and
+a plain `pip install torch` on Blackwell silently falls back to CPU
+(or crashes with "no kernel image available for device"). Do not
+create a venv on the training box — `pip install torch` will fight
+the NGC build.
+
+Build the image once:
+
+```bash
+docker build -t guugo-train .
+```
+
+Run training:
+
+```bash
+docker run --rm -it --gpus all --ipc=host \
+  -v "$PWD":/workspace -w /workspace \
+  guugo-train \
+  python scripts/automated_training.py
+```
+
+Flags that matter:
+
+- `--gpus all` — expose every GPU; replace with `--gpus '"device=0"'`
+  to pin one.
+- `--ipc=host` — required for `torch.multiprocessing` shared memory.
+  The default 64 MB `/dev/shm` in Docker will kill the worker pool
+  with bus errors. (Alternative: `--shm-size=8g`.)
+- `-v "$PWD":/workspace` — keeps `checkpoints/` and `replay/` on the
+  host so they survive container restarts and can be rsync'd to
+  another machine.
+
+Quick GPU sanity check inside the container:
+
+```bash
+docker run --rm --gpus all guugo-train \
+  python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.get_device_capability(0))"
+```
+
+On Blackwell you should see something like
+`2.6.0a0+ecf3bae40a.nv25.03 12.8 True (10, 0)`.
 
 ---
 
@@ -92,36 +139,48 @@ There are three entry points under [`scripts/`](scripts):
 Recommended single-box run (Ctrl-C saves a final checkpoint):
 
 ```bash
-python scripts/automated_training.py
+docker run --rm -it --gpus all --ipc=host \
+  -v "$PWD":/workspace -w /workspace \
+  guugo-train \
+  python scripts/automated_training.py
 ```
 
 That is equivalent to the fully-explicit form:
 
 ```bash
-python scripts/automated_training.py \
-  --device cuda \
-  --num-workers $(nproc) \
-  --games-per-worker 1 \
-  --train-steps-per-cycle 200 \
-  --save-interval-seconds 3600 \
-  --checkpoint-dir checkpoints \
-  --replay-dir replay
+docker run --rm -it --gpus all --ipc=host \
+  -v "$PWD":/workspace -w /workspace \
+  guugo-train \
+  python scripts/automated_training.py \
+    --device cuda \
+    --num-workers $(nproc) \
+    --games-per-worker 1 \
+    --train-steps-per-cycle 200 \
+    --save-interval-seconds 3600 \
+    --checkpoint-dir checkpoints \
+    --replay-dir replay
 ```
 
 Defaults: trainer on CUDA, one self-play worker per CPU core, one-hour
 checkpoint cadence. Workers always run inference on CPU (small 9x9
-net, dozens of cores, no contention for the GPU). On a machine without
-a GPU, pass `--device cpu`; on Apple Silicon you can pass `--device
-auto` to resolve to MPS.
+net, dozens of cores, no contention for the GPU). On a machine
+without a GPU you can run the script directly (outside Docker) with
+`--device cpu`; on Apple Silicon, pass `--device auto` to resolve to
+MPS.
 
-Decoupled layout (separate shells / hosts share the same dirs):
+Decoupled layout (separate shells / hosts share the same dirs). On a
+single box you can open two containers bound to the same volume:
 
 ```bash
 # terminal 1 - trainer
-python scripts/train.py --checkpoint-dir checkpoints --replay-dir replay
+docker run --rm -it --gpus all --ipc=host \
+  -v "$PWD":/workspace -w /workspace guugo-train \
+  python scripts/train.py --checkpoint-dir checkpoints --replay-dir replay
 
-# terminal 2..N - workers
-python scripts/self_play.py --checkpoint-dir checkpoints --replay-dir replay
+# terminal 2..N - workers (CPU-only is fine for workers)
+docker run --rm -it --ipc=host \
+  -v "$PWD":/workspace -w /workspace guugo-train \
+  python scripts/self_play.py --checkpoint-dir checkpoints --replay-dir replay
 ```
 
 Key knobs live in [`alphazero/config.py`](alphazero/config.py):
@@ -175,6 +234,7 @@ scripts/
   self_play.py                # long-running worker CLI
   train.py                    # long-running trainer CLI
 tests/                        # pytest suites (see above)
+Dockerfile                    # NGC PyTorch + pytest; training container
 Architecture.md               # system design, data flow, scaling notes
 ```
 
