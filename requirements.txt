@@ -1,8 +1,13 @@
 # GuuGo dependencies. Install into a venv with:
 #     pip install -r requirements.txt
 #
-# Runtime:
+# Runtime (beginner PvP app):
 pygame>=2.5
 
 # Dev / test:
 pytest>=8.0
+
+# AlphaZero training stack. `torch` is a large download; if you only need
+# the PvP game you can skip this file and install just `pygame` + `pytest`.
+numpy>=1.26
+torch>=2.2

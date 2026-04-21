@@ -16,7 +16,7 @@ Rules implemented (per the assignment):
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 from .board import (
     BOARD_SIZE,
@@ -85,6 +85,67 @@ class GameEngine:
         """Return a mutable copy of the board as a list of lists of Color."""
 
         return [list(row) for row in self._board]
+
+    @property
+    def board_grid(self) -> BoardGrid:
+        """Return the raw immutable board grid.
+
+        This is intended for hot paths like the AlphaZero state encoder /
+        MCTS, which do not need a defensive copy. Do not mutate.
+        """
+
+        return self._board
+
+    def clone(self) -> "GameEngine":
+        """Return a new engine in the exact same state.
+
+        Cheap because the board grid is already an immutable tuple of
+        tuples. MCTS uses this to branch on trial moves without touching
+        the real game state.
+        """
+
+        twin = GameEngine(self._size)
+        twin._board = self._board
+        twin._current = self._current
+        twin._previous_board = self._previous_board
+        twin._captured = dict(self._captured)
+        twin._last_move = self._last_move
+        twin._result = self._result
+        twin._move_number = self._move_number
+        return twin
+
+    def iter_legal_points(self, color: Optional[Color] = None) -> Iterator[Point]:
+        """Yield every board point that is a legal move for ``color``."""
+
+        mover = color if color is not None else self._current
+        if self._result is not None:
+            return
+        for r in range(self._size):
+            for c in range(self._size):
+                if self._board[r][c] is not Color.EMPTY:
+                    continue
+                legal, _ = self.is_legal((r, c), mover)
+                if legal:
+                    yield (r, c)
+
+    def legal_points(self, color: Optional[Color] = None) -> List[Point]:
+        """List form of :meth:`iter_legal_points`."""
+
+        return list(self.iter_legal_points(color))
+
+    def terminal_value(self, color: Color) -> float:
+        """Return the game result as +1 / -1 / 0 from ``color``'s view.
+
+        Raises if the game is not over; MCTS should gate this on
+        :attr:`is_over`. A tie returns ``0`` (extremely rare with komi 2.5
+        but the :class:`GameResult` type allows it).
+        """
+
+        if self._result is None:
+            raise RuntimeError("terminal_value called on unfinished game")
+        if self._result.winner is None:
+            return 0.0
+        return 1.0 if self._result.winner is color else -1.0
 
     # ---------------- rule checks ----------------
 
