@@ -85,6 +85,12 @@ On Blackwell you should see something like
 python main.py
 ```
 
+This opens a small startup menu with two options:
+
+- **Play vs Friend (PvP)** — the classic two-humans-at-one-keyboard mode.
+- **Play vs Computer (PvE)** — plays against a trained AlphaZero model
+  (see [Playing vs the AI](#playing-vs-the-ai) below).
+
 Click an intersection to place a stone. The most recent move is
 highlighted with a red ring. Capture counts and the current player are
 shown above the board.
@@ -97,6 +103,36 @@ Controls:
   Chinese area score with a 2.5 komi for White.
 - `New Game` button or **N** key — reset the board.
 - **Esc** — quit the application.
+
+### Playing vs the AI
+
+The PvE panel on the startup menu takes one input:
+
+- **Checkpoint directory** — path to a directory containing `latest.pt`
+  (written by the training pipeline). Defaults to `checkpoints`.
+  Checkpoints are gitignored (`*.pt`), so they do **not** sync
+  automatically between machines. If you've been training on
+  `spark-43f4`, rsync the directory over to your laptop first, e.g.
+
+  ```bash
+  rsync -av spark-43f4:~/GuuGo/checkpoints ./
+  ```
+
+The AI runs a fixed 100 MCTS simulations per move — strong enough to
+play real moves, fast enough that you rarely wait more than a second or
+two. If you want a different strength, change `DEFAULT_SIMULATIONS` in
+[`go_game/menu.py`](go_game/menu.py).
+
+When you click **Play vs Computer**, the app loads the checkpoint and
+drops into a normal board view with the human as Black and the AI as
+White. The title bar shows `(vs AI)` and a banner reads "AI is
+thinking..." while MCTS runs. If loading fails (no `latest.pt`, torch
+not installed, corrupted checkpoint, ...) the menu stays open and shows
+the error — pick a different directory or install torch and try again.
+
+PvE is the one place where the PvP app needs the training stack
+installed (`pip install --user torch`). Plain PvP works with just
+`pygame`.
 
 ### Engine interface
 

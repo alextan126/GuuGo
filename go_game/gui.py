@@ -1,18 +1,25 @@
-"""Pygame GUI for GuuGo's PvP mode.
+"""Pygame GUI for GuuGo (PvP + PvE).
 
-The GUI is a thin presentation layer over :class:`GameEngine`. It draws the
-board, handles click-to-play, highlights the most recent move, shows capture
-counts, and surfaces the game result. All rules logic lives in the engine.
+The GUI is a thin presentation layer over :class:`GameEngine`. It draws
+the board, handles click-to-play, highlights the most recent move,
+shows capture counts, and surfaces the game result. All rules logic
+lives in the engine.
 
 We use pygame because it is a single pure-pip dependency (``pip install
-pygame``) with no system packages required, which makes the app trivial to
-ship to a grader: ``pip install --user -r requirements.txt`` then
+pygame``) with no system packages required, which makes the app trivial
+to ship to a grader: ``pip install --user -r requirements.txt`` then
 ``python main.py``. No virtualenvs needed.
+
+PvE mode is opt-in via the ``ai_player`` argument on :class:`GoGUI`.
+When set, the human plays Black and the AI plays White; the AI runs
+MCTS on a background thread so the pygame loop keeps drawing while it
+thinks.
 """
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+import threading
+from typing import Any, Optional, Tuple
 
 import pygame
 
@@ -64,9 +71,19 @@ class _Button:
 
 
 class GoGUI:
-    """Pygame application window for PvP play."""
+    """Pygame application window for PvP or PvE play.
 
-    def __init__(self, engine: Optional[GameEngine] = None) -> None:
+    PvE is opt-in via the ``ai_player`` keyword argument: when provided,
+    the AI plays White after every legal human (Black) move, from a
+    background thread so the main loop never blocks on MCTS.
+    """
+
+    def __init__(
+        self,
+        engine: Optional[GameEngine] = None,
+        *,
+        ai_player: Optional[Any] = None,
+    ) -> None:
         self.engine = engine or GameEngine()
 
         self._board_pixels = BOARD_MARGIN * 2 + CELL_SIZE * (self.engine.size - 1)
@@ -74,7 +91,10 @@ class GoGUI:
         self._height = HUD_HEIGHT + self._board_pixels
 
         pygame.init()
-        pygame.display.set_caption("GuuGo - 9x9 Go")
+        caption = "GuuGo - 9x9 Go"
+        if ai_player is not None:
+            caption += " (vs AI)"
+        pygame.display.set_caption(caption)
         self.screen = pygame.display.set_mode((self._width, self._height))
         self.clock = pygame.time.Clock()
 
@@ -86,6 +106,23 @@ class GoGUI:
         self.buttons = self._build_buttons()
         self._banner_text: Optional[str] = None
         self._banner_timer_ms: int = 0
+
+        # --- AI / PvE state ---
+        # The AI plays the White side. MCTS runs in a daemon thread so
+        # the GUI stays interactive. The main thread remains the only
+        # place that mutates ``self.engine``, which keeps rendering and
+        # rules logic race-free.
+        self.ai_player = ai_player
+        self._ai_color: Color = Color.WHITE
+        self._ai_lock = threading.Lock()
+        self._ai_thread: Optional[threading.Thread] = None
+        self._ai_pending_move: Optional[Optional[Point]] = None
+        self._ai_pending_game_id: int = -1
+        self._ai_thinking = False
+        # ``_game_id`` is bumped on every ``New Game``. The AI thread
+        # stamps its result with the id it started under, so a reset
+        # while the AI is thinking discards the stale move.
+        self._game_id = 0
 
     # ---------------- layout ----------------
 
@@ -134,17 +171,30 @@ class GoGUI:
         if self.engine.is_over:
             result = self.engine.result
             assert result is not None
-            if result.winner is None:
-                winner_text = "Tie"
+            if self.ai_player is not None:
+                # PvE: frame the outcome from the human's (Black) POV.
+                human_color = Color.BLACK
+                if result.winner is None:
+                    winner_text = "Tie"
+                elif result.winner is human_color:
+                    winner_text = "You win!"
+                else:
+                    winner_text = "You lose."
             else:
-                winner_text = f"{result.winner.name.title()} wins"
+                if result.winner is None:
+                    winner_text = "Tie"
+                else:
+                    winner_text = f"{result.winner.name.title()} wins"
             title = (
                 f"Game over - {winner_text} "
                 f"(Black {result.black_score:g}, White {result.white_score:g})"
             )
         else:
             player = self.engine.current_player
-            title = f"{player.name.title()} to move"
+            if self.ai_player is not None and player is self._ai_color:
+                title = f"{player.name.title()} (AI) to move"
+            else:
+                title = f"{player.name.title()} to move"
 
         title_surface = self.title_font.render(title, True, TEXT_COLOR)
         self.screen.blit(title_surface, (16, 14))
@@ -236,6 +286,12 @@ class GoGUI:
     def _handle_board_click(self, pos: Tuple[int, int]) -> None:
         if self.engine.is_over:
             return
+        if self._ai_thinking:
+            return
+        if self.ai_player is not None and self.engine.current_player is self._ai_color:
+            # Shouldn't normally happen (AI would already be thinking)
+            # but guards against a stale click sneaking in.
+            return
         point = self._pixel_to_point(pos[0], pos[1])
         if point is None:
             return
@@ -245,26 +301,118 @@ class GoGUI:
             return
         if result.captured:
             self._set_banner(f"Captured {len(result.captured)} stone(s)")
+        self._maybe_start_ai_turn()
 
     def _handle_button(self, action: str) -> None:
         if action == "pass":
-            if self.engine.is_over:
+            if self.engine.is_over or self._ai_thinking:
                 return
             loser = self.engine.current_player
             self.engine.pass_turn()
             self._set_banner(f"{loser.name.title()} passed - concedes game")
         elif action == "score":
-            if self.engine.is_over:
+            if self.engine.is_over or self._ai_thinking:
                 return
             self.engine.finish_by_score()
             self._set_banner("Game scored")
         elif action == "new":
+            with self._ai_lock:
+                self._game_id += 1
+                self._ai_pending_move = None
+                self._ai_pending_game_id = -1
+                self._ai_thinking = False
             self.engine.reset()
             self._set_banner("New game started")
+            self._maybe_start_ai_turn()
+
+    # ---------------- AI turn ----------------
+
+    def _maybe_start_ai_turn(self) -> None:
+        """Spawn MCTS on a daemon thread if it's the AI's move."""
+
+        if self.ai_player is None:
+            return
+        if self.engine.is_over:
+            return
+        if self.engine.current_player is not self._ai_color:
+            return
+        if self._ai_thinking:
+            return
+
+        self._ai_thinking = True
+        self._set_banner("AI is thinking...", duration_ms=60_000)
+        engine_snapshot = self.engine.clone()
+        game_id = self._game_id
+        ai = self.ai_player
+
+        def _run() -> None:
+            try:
+                move = ai.choose_move(engine_snapshot)
+            except Exception:
+                move = None
+            with self._ai_lock:
+                # Only publish if this thread started under the current
+                # game; otherwise the user already pressed New Game.
+                if game_id == self._game_id:
+                    self._ai_pending_move = move
+                    self._ai_pending_game_id = game_id
+
+        thread = threading.Thread(target=_run, name="guugo-ai", daemon=True)
+        self._ai_thread = thread
+        thread.start()
+
+    def _drain_ai_pending(self) -> None:
+        """Apply a finished AI move on the main thread (pygame-safe)."""
+
+        if not self._ai_thinking:
+            return
+        with self._ai_lock:
+            pending_game_id = self._ai_pending_game_id
+            move = self._ai_pending_move
+            thread_done = self._ai_thread is None or not self._ai_thread.is_alive()
+            has_pending = pending_game_id == self._game_id and thread_done
+            if has_pending:
+                self._ai_pending_move = None
+                self._ai_pending_game_id = -1
+        if not has_pending:
+            return
+
+        self._ai_thinking = False
+        self._banner_text = None
+        self._banner_timer_ms = 0
+
+        if move is None:
+            # AI had nothing to play. Two sub-cases:
+            #   (a) engine is already over (someone resigned, scored, etc.)
+            #   (b) AI has no legal board move and refuses to pass
+            # In (b) we end the game by area scoring so the GUI never
+            # gets stuck waiting on a phantom AI turn. The human picks
+            # this up from the game-over HUD + banner.
+            if not self.engine.is_over:
+                self.engine.finish_by_score()
+                self._set_banner(
+                    "AI has no legal move - game scored.", duration_ms=4000
+                )
+            return
+        if self.engine.is_over:
+            return
+
+        result = self.engine.play(move)
+        if not result.legal:
+            # choose_move filters to legal points; if we hit this it's a
+            # bug. Surface it rather than silently hanging the AI turn.
+            self._set_banner(f"AI suggested illegal move: {result.reason}")
+            return
+        if result.captured:
+            self._set_banner(f"AI captured {len(result.captured)} stone(s)")
 
     # ---------------- main loop ----------------
 
     def run(self) -> None:
+        # If the game starts on the AI's turn (e.g. configured to play
+        # first in a future change), kick it off immediately.
+        self._maybe_start_ai_turn()
+
         running = True
         while running:
             dt = self.clock.tick(60)
@@ -272,6 +420,8 @@ class GoGUI:
                 self._banner_timer_ms -= dt
                 if self._banner_timer_ms <= 0:
                     self._banner_text = None
+
+            self._drain_ai_pending()
 
             mouse_pos = pygame.mouse.get_pos()
             for button in self.buttons:
@@ -305,5 +455,30 @@ class GoGUI:
         pygame.quit()
 
 
-def launch() -> None:
-    GoGUI().run()
+def launch(ai_player: Optional[Any] = None) -> None:
+    """Entry point. Shows a menu first, then the board.
+
+    Passing ``ai_player`` skips the menu and drops straight into a PvE
+    game with that AI. When ``ai_player`` is ``None`` (the default
+    ``main.py`` flow), the startup menu decides between PvP and PvE and
+    constructs the :class:`AIPlayer` as needed.
+    """
+
+    if ai_player is not None:
+        GoGUI(ai_player=ai_player).run()
+        return
+
+    # Deferred import so ``go_game.gui`` stays importable when pygame
+    # isn't present at module scan time (e.g. while running pytest
+    # against the rules engine in a minimal environment).
+    from .menu import MainMenu
+
+    result = MainMenu().run()
+    if result.mode == "quit":
+        return
+    if result.mode == "pvp":
+        GoGUI().run()
+        return
+    if result.mode == "pve":
+        GoGUI(ai_player=result.ai_player).run()
+        return
