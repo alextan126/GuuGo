@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# training artifacts - sync via rsync, not git
+checkpoints/
+replay/
+*.pt
+*.pkl

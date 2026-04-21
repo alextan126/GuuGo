@@ -26,10 +26,15 @@ hour) so you get a predictable on-disk cadence regardless of cycle
 length. Ctrl-C saves a final checkpoint and joins the workers before
 exit.
 
-Typical usage::
+Default usage (trainer on CUDA, one self-play worker per CPU core)::
+
+    python scripts/automated_training.py
+
+is equivalent to::
 
     python scripts/automated_training.py \\
-        --num-workers 18 \\
+        --device cuda \\
+        --num-workers $(nproc) \\
         --games-per-worker 1 \\
         --train-steps-per-cycle 200 \\
         --save-interval-seconds 3600
@@ -38,9 +43,10 @@ Notes on device choice:
 - Workers always run inference on CPU. With a small 9x9 network and
   dozens of CPU cores, CPU-batched inference per worker is fine and
   avoids fighting over one GPU.
-- The trainer honors ``--device`` (``auto``/``cuda``/``cpu``/``mps``).
-  If the trainer runs on GPU, each cycle we copy its weights down to
-  the CPU shared-memory model that the workers see.
+- The trainer defaults to ``--device cuda``. On a machine without a
+  GPU pass ``--device cpu``; use ``--device auto`` to let the runtime
+  pick cuda > mps > cpu. The trainer's weights are copied into the
+  CPU shared-memory inference model at the end of each cycle.
 """
 
 from __future__ import annotations
@@ -140,7 +146,10 @@ def _worker_entry(
 
 
 def _parse_args() -> argparse.Namespace:
-    default_workers = max(1, (os.cpu_count() or 4) - 2)
+    # Default to using every core for self-play. The user's target box
+    # has 20 cores; on other hardware we fall through to whatever the OS
+    # reports, capped at a sane lower bound.
+    default_workers = os.cpu_count() or 20
 
     p = argparse.ArgumentParser(
         description=(
@@ -154,8 +163,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--device",
         type=str,
-        default="auto",
-        help="Device for the TRAINER (workers always run on CPU).",
+        default="cuda",
+        help=(
+            "Device for the TRAINER (workers always run on CPU). "
+            "Default: cuda. Use 'cpu' on a machine without a GPU, or "
+            "'auto' to let the runtime pick cuda > mps > cpu."
+        ),
     )
     # ---- cadence ----
     p.add_argument(
@@ -170,7 +183,7 @@ def _parse_args() -> argparse.Namespace:
         default=default_workers,
         help=(
             f"Number of self-play processes "
-            f"(default: os.cpu_count() - 2 = {default_workers})."
+            f"(default: all cores = {default_workers})."
         ),
     )
     p.add_argument(

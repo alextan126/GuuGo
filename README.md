@@ -89,24 +89,30 @@ There are three entry points under [`scripts/`](scripts):
   that ingests replay files, trains the network, and publishes new
   checkpoints. Pair with one or more `self_play.py` workers.
 
-Recommended single-box run on a 20-core CPU box (Ctrl-C saves a final
-checkpoint):
+Recommended single-box run (Ctrl-C saves a final checkpoint):
+
+```bash
+python scripts/automated_training.py
+```
+
+That is equivalent to the fully-explicit form:
 
 ```bash
 python scripts/automated_training.py \
-  --num-workers 18 \
+  --device cuda \
+  --num-workers $(nproc) \
   --games-per-worker 1 \
   --train-steps-per-cycle 200 \
   --save-interval-seconds 3600 \
   --checkpoint-dir checkpoints \
-  --replay-dir replay \
-  --device cpu
+  --replay-dir replay
 ```
 
-Workers always run inference on CPU (small 9x9 net, dozens of cores,
-no contention). `--device` selects the trainer's device; on a machine
-with a single GPU, setting `--device cuda` runs gradient descent on
-the GPU while CPU workers keep self-play saturated.
+Defaults: trainer on CUDA, one self-play worker per CPU core, one-hour
+checkpoint cadence. Workers always run inference on CPU (small 9x9
+net, dozens of cores, no contention for the GPU). On a machine without
+a GPU, pass `--device cpu`; on Apple Silicon you can pass `--device
+auto` to resolve to MPS.
 
 Decoupled layout (separate shells / hosts share the same dirs):
 
