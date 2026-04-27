@@ -10,13 +10,28 @@ Rules implemented (per the assignment):
     * Liberties / capture of zero-liberty groups.
     * Positional superko against the immediately preceding board (simple ko).
     * Suicide is illegal unless the move first captures opposing stones.
-    * Passing is treated as resignation.
-    * Chinese area scoring with a komi of 2.5 for White.
+    * Standard two-pass end-of-game (`pass_move`): the second consecutive pass
+      enters the SCORING phase (dead stones auto-marked, then user-editable).
+    * Explicit resignation (`resign`): the current player concedes, skipping
+      the scoring phase.
+    * Chinese area scoring with a komi of 2.5 for White, with dead-stone
+      awareness when finalized via `confirm_score`.
+
+Lifecycle:
+
+    PLAYING --pass_move (2nd) / enter_scoring--> SCORING --confirm_score--> FINISHED
+    PLAYING --resign-------------------------->                             FINISHED
+    SCORING --cancel_scoring--> PLAYING
+    SCORING --resign---------->                                             FINISHED
+
+The legacy ``pass_turn`` method (single pass = resignation) is kept for the
+AlphaZero training pipeline, which treats pass as a terminal action, along
+with ``finish_by_score`` which skips the scoring phase entirely.
 """
 
 from __future__ import annotations
 
-from typing import Iterator, List, Optional, Tuple
+from typing import FrozenSet, Iterator, List, Optional, Tuple
 
 from .board import (
     BOARD_SIZE,
@@ -27,7 +42,7 @@ from .board import (
     remove_points,
     set_point,
 )
-from .scoring import area_score
+from .scoring import area_score, auto_dead_stones, group_at, score_breakdown
 from .types import Color, GameResult, MoveResult, Point
 
 
@@ -47,6 +62,15 @@ class GameEngine:
         self._last_move: Optional[Point] = None
         self._result: Optional[GameResult] = None
         self._move_number: int = 0
+        # Number of consecutive passes seen at the tail of the move history.
+        # Reset to zero on every successful stone placement; two in a row
+        # enters the SCORING phase under the standard Go rule.
+        self._consecutive_passes: int = 0
+        # SCORING-phase state. When ``_in_scoring`` is True the engine
+        # rejects new plays; ``_dead_stones`` is the user/auto-marked
+        # dead set used by ``confirm_score``.
+        self._in_scoring: bool = False
+        self._dead_stones: FrozenSet[Point] = frozenset()
 
     # ---------------- public state accessors ----------------
 
@@ -65,6 +89,24 @@ class GameEngine:
     @property
     def move_number(self) -> int:
         return self._move_number
+
+    @property
+    def consecutive_passes(self) -> int:
+        """How many passes have been played in a row at the tail of history."""
+
+        return self._consecutive_passes
+
+    @property
+    def is_scoring(self) -> bool:
+        """True while the engine is in the SCORING phase awaiting confirmation."""
+
+        return self._in_scoring
+
+    @property
+    def dead_stones(self) -> FrozenSet[Point]:
+        """Current set of stones marked dead (valid only during SCORING)."""
+
+        return self._dead_stones
 
     @property
     def is_over(self) -> bool:
@@ -112,6 +154,9 @@ class GameEngine:
         twin._last_move = self._last_move
         twin._result = self._result
         twin._move_number = self._move_number
+        twin._consecutive_passes = self._consecutive_passes
+        twin._in_scoring = self._in_scoring
+        twin._dead_stones = self._dead_stones
         return twin
 
     def iter_legal_points(self, color: Optional[Color] = None) -> Iterator[Point]:
@@ -159,6 +204,8 @@ class GameEngine:
 
         if self._result is not None:
             return False, "game is over"
+        if self._in_scoring:
+            return False, "scoring phase"
 
         mover = color if color is not None else self._current
 
@@ -196,6 +243,7 @@ class GameEngine:
         self._captured[self._current] += len(captured)
         self._last_move = point
         self._move_number += 1
+        self._consecutive_passes = 0
         self._current = self._current.opponent()
 
         return MoveResult(
@@ -205,8 +253,162 @@ class GameEngine:
             move=point,
         )
 
+    def pass_move(self) -> None:
+        """Standard Go pass.
+
+        Two consecutive passes transition the engine into the SCORING
+        phase (see :meth:`enter_scoring`). The caller should then let
+        the player review the proposed dead stones and call
+        :meth:`confirm_score` (or :meth:`cancel_scoring` to go back).
+
+        This method returns ``None`` in all cases. Callers can check
+        :attr:`is_scoring` / :attr:`consecutive_passes` to observe the
+        transition.
+        """
+
+        if self._result is not None or self._in_scoring:
+            return
+
+        self._consecutive_passes += 1
+        self._move_number += 1
+        self._last_move = None
+        self._current = self._current.opponent()
+
+        if self._consecutive_passes >= 2:
+            self.enter_scoring()
+
+    def enter_scoring(self) -> None:
+        """Transition PLAYING -> SCORING and auto-mark dead stones.
+
+        Idempotent: calling while already in SCORING simply re-runs
+        :meth:`auto_mark_dead`.
+        """
+
+        if self._result is not None:
+            return
+        self._in_scoring = True
+        self.auto_mark_dead()
+
+    def auto_mark_dead(self) -> None:
+        """Recompute the heuristic dead-stone set from the current board.
+
+        Used after ``enter_scoring`` to seed the proposal; callers (e.g.
+        the GUI) may also invoke it explicitly to reset any manual
+        overrides the user has made.
+        """
+
+        if not self._in_scoring:
+            return
+        self._dead_stones = auto_dead_stones(self._board)
+
+    def toggle_group_dead(self, point: Point) -> None:
+        """Flip the entire connected group at ``point`` dead <-> alive.
+
+        No-op outside SCORING, on out-of-bounds points, or on empty
+        points. The whole connected group is toggled together, matching
+        how a Go player would mark dead stones.
+        """
+
+        if not self._in_scoring:
+            return
+        r, c = point
+        if not (0 <= r < self._size and 0 <= c < self._size):
+            return
+        group = group_at(self._board, point)
+        if group is None:
+            return
+
+        new_dead = set(self._dead_stones)
+        if group & new_dead:
+            # Any overlap -> treat group as currently-dead, remove it.
+            new_dead.difference_update(group)
+        else:
+            new_dead.update(group)
+        self._dead_stones = frozenset(new_dead)
+
+    def confirm_score(self) -> GameResult:
+        """Finalize the SCORING phase using the current dead-stone set.
+
+        Computes Chinese area scoring with dead stones counted as
+        territory for the surrounding color and sets the game result.
+        Transitions SCORING -> FINISHED.
+        """
+
+        if self._result is not None:
+            return self._result
+        if not self._in_scoring:
+            # Be forgiving: auto-enter scoring first so the caller gets
+            # a sensible result even if they skipped the transition.
+            self.enter_scoring()
+
+        breakdown = score_breakdown(self._board, dead_stones=self._dead_stones)
+        if breakdown.black_score > breakdown.white_score:
+            winner: Optional[Color] = Color.BLACK
+        elif breakdown.white_score > breakdown.black_score:
+            winner = Color.WHITE
+        else:
+            winner = None
+        self._result = GameResult(
+            winner=winner,
+            black_score=breakdown.black_score,
+            white_score=breakdown.white_score,
+            reason="score",
+        )
+        self._in_scoring = False
+        return self._result
+
+    def cancel_scoring(self) -> None:
+        """Return SCORING -> PLAYING, discarding any dead-stone proposal.
+
+        Leaves ``consecutive_passes`` at 1 so a single fresh pass is
+        enough to re-enter scoring, matching the intuition that the
+        previous pass-pass sequence was "almost" the end.
+        """
+
+        if not self._in_scoring or self._result is not None:
+            return
+        self._in_scoring = False
+        self._dead_stones = frozenset()
+        self._consecutive_passes = 1
+
+    def resign(self) -> GameResult:
+        """Current player resigns; the opponent wins by resignation.
+
+        Area scores (with komi, dead-stone aware if we're in scoring)
+        are still recorded for HUD display, but the winner is
+        determined by the resignation, not the score. Works in either
+        PLAYING or SCORING.
+        """
+
+        if self._result is not None:
+            return self._result
+
+        loser = self._current
+        winner = loser.opponent()
+        if self._in_scoring:
+            breakdown = score_breakdown(self._board, dead_stones=self._dead_stones)
+            black_score = breakdown.black_score
+            white_score = breakdown.white_score
+        else:
+            black_score, white_score = area_score(self._board)
+        self._result = GameResult(
+            winner=winner,
+            black_score=black_score,
+            white_score=white_score,
+            reason="resignation",
+        )
+        self._in_scoring = False
+        return self._result
+
     def pass_turn(self) -> GameResult:
-        """Passing concedes the game per the assignment rules."""
+        """Legacy single-pass-resigns entry point.
+
+        Retained because the AlphaZero training stack
+        (``alphazero/self_play.py`` and ``alphazero/mcts.py``) treats a
+        pass as a terminal action. New code (the GUI) should call
+        :meth:`pass_move` for the standard two-pass rule or
+        :meth:`resign` to concede explicitly.
+        """
 
         if self._result is not None:
             return self._result
@@ -223,27 +425,32 @@ class GameEngine:
         return self._result
 
     def finish_by_score(self) -> GameResult:
-        """End the game and compute the winner from Chinese area scoring.
+        """End the game with dead-stone-aware Chinese area scoring.
 
-        This is not required by the assignment (which ends games on pass),
-        but it is a convenient entry point for the GUI's "Score Game" action
-        and for the test harness.
+        This bypasses the interactive SCORING phase but still runs the
+        :func:`auto_dead_stones` heuristic so the terminal score matches
+        what a player would see after confirming the GUI's auto
+        proposal. The AlphaZero training pipeline relies on this entry
+        point for capped games and benefits from the stronger evaluator;
+        the GUI's "skip dead-stone review" escape hatch is the same
+        deterministic computation.
         """
 
         if self._result is not None:
             return self._result
 
-        black_score, white_score = area_score(self._board)
-        if black_score > white_score:
+        dead = auto_dead_stones(self._board)
+        breakdown = score_breakdown(self._board, dead_stones=dead)
+        if breakdown.black_score > breakdown.white_score:
             winner: Optional[Color] = Color.BLACK
-        elif white_score > black_score:
+        elif breakdown.white_score > breakdown.black_score:
             winner = Color.WHITE
         else:
             winner = None
         self._result = GameResult(
             winner=winner,
-            black_score=black_score,
-            white_score=white_score,
+            black_score=breakdown.black_score,
+            white_score=breakdown.white_score,
             reason="score",
         )
         return self._result
@@ -258,6 +465,9 @@ class GameEngine:
         self._last_move = None
         self._result = None
         self._move_number = 0
+        self._consecutive_passes = 0
+        self._in_scoring = False
+        self._dead_stones = frozenset()
 
     # ---------------- internals ----------------
 

@@ -24,13 +24,16 @@ from typing import Any, Optional, Tuple
 import pygame
 
 from .engine import GameEngine
+from .scoring import KOMI, score_breakdown
 from .types import Color, Point
 
 BOARD_MARGIN = 48
 CELL_SIZE = 60
 STONE_RADIUS = 26
-HUD_HEIGHT = 110
+HUD_HEIGHT = 130
 BANNER_HEIGHT = 40
+TERRITORY_MARK_SIZE = 14
+DAME_DOT_RADIUS = 4
 
 BOARD_BG = (221, 176, 107)
 WINDOW_BG = (245, 238, 224)
@@ -48,24 +51,44 @@ BUTTON_BORDER = (120, 100, 60)
 BUTTON_TEXT = (30, 30, 30)
 BANNER_BG = (50, 50, 55)
 BANNER_TEXT = (240, 240, 240)
+TERRITORY_BLACK = (17, 17, 17, 150)
+TERRITORY_WHITE = (245, 245, 245, 180)
+TERRITORY_BORDER = (30, 30, 30, 200)
+DAME_COLOR = (110, 110, 110, 200)
 
 STAR_POINTS = ((2, 2), (2, 4), (2, 6), (4, 2), (4, 4), (4, 6), (6, 2), (6, 4), (6, 6))
 
 
 class _Button:
-    """Minimal click-and-hover rectangular button used in the HUD."""
+    """Minimal click-and-hover rectangular button used in the HUD.
+
+    Supports a ``visible`` flag (renderer skips hidden buttons entirely)
+    and an ``enabled`` flag (button is drawn greyed out and ignores
+    clicks). The main loop should consult both before dispatching.
+    """
 
     def __init__(self, rect: pygame.Rect, label: str, action: str) -> None:
         self.rect = rect
         self.label = label
         self.action = action
         self.hover = False
+        self.visible = True
+        self.enabled = True
 
     def draw(self, surface: pygame.Surface, font: pygame.font.Font) -> None:
-        bg = BUTTON_BG_HOVER if self.hover else BUTTON_BG
+        if not self.visible:
+            return
+        if self.enabled:
+            bg = BUTTON_BG_HOVER if self.hover else BUTTON_BG
+            fg = BUTTON_TEXT
+            border = BUTTON_BORDER
+        else:
+            bg = BUTTON_BG
+            fg = (150, 150, 150)
+            border = (180, 170, 150)
         pygame.draw.rect(surface, bg, self.rect, border_radius=6)
-        pygame.draw.rect(surface, BUTTON_BORDER, self.rect, width=1, border_radius=6)
-        text = font.render(self.label, True, BUTTON_TEXT)
+        pygame.draw.rect(surface, border, self.rect, width=1, border_radius=6)
+        text = font.render(self.label, True, fg)
         text_rect = text.get_rect(center=self.rect.center)
         surface.blit(text, text_rect)
 
@@ -126,23 +149,68 @@ class GoGUI:
 
     # ---------------- layout ----------------
 
-    def _build_buttons(self) -> list:
-        labels = [
-            ("Pass (Resign)", "pass"),
-            ("Score Game", "score"),
-            ("New Game", "new"),
-        ]
-        button_w, button_h = 130, 32
-        gap = 8
-        total_w = len(labels) * button_w + (len(labels) - 1) * gap
-        start_x = self._width - total_w - 16
-        y = HUD_HEIGHT - button_h - 14
+    # Button dimensions used by both the full (PLAYING) set and the
+    # smaller (SCORING / FINISHED) sets. All buttons share the same
+    # height and y-row so the HUD layout stays stable across phases.
+    _BUTTON_W = 100
+    _BUTTON_H = 32
+    _BUTTON_GAP = 6
 
+    def _build_buttons(self) -> list:
+        """Create one :class:`_Button` per action.
+
+        Actual visibility/enabled state and on-screen positions are
+        recomputed every frame by :meth:`_layout_buttons`, which slots
+        the visible subset right-to-left inside the HUD.
+        """
+
+        actions = ["pass", "resign", "score", "confirm", "resume", "new"]
+        labels = {
+            "pass": "Pass",
+            "resign": "Resign",
+            "score": "Score Game",
+            "confirm": "Confirm Score",
+            "resume": "Resume Game",
+            "new": "New Game",
+        }
         buttons = []
-        for i, (label, action) in enumerate(labels):
-            rect = pygame.Rect(start_x + i * (button_w + gap), y, button_w, button_h)
-            buttons.append(_Button(rect, label, action))
+        for action in actions:
+            rect = pygame.Rect(0, 0, self._BUTTON_W, self._BUTTON_H)
+            buttons.append(_Button(rect, labels[action], action))
         return buttons
+
+    def _visible_actions_for_phase(self) -> list:
+        """Return the ordered list of button actions for the current phase."""
+
+        if self.engine.is_over:
+            return ["new"]
+        if self.engine.is_scoring:
+            return ["confirm", "resume", "resign", "new"]
+        return ["pass", "resign", "score", "new"]
+
+    def _layout_buttons(self) -> None:
+        """Position the subset of visible buttons for the current phase."""
+
+        visible = self._visible_actions_for_phase()
+        by_action = {b.action: b for b in self.buttons}
+        # Default: everything hidden.
+        for b in self.buttons:
+            b.visible = False
+            b.enabled = True
+
+        y = HUD_HEIGHT - self._BUTTON_H - 14
+        # Confirm Score is wider so the label doesn't overflow.
+        widths = {a: self._BUTTON_W for a in visible}
+        if "confirm" in visible:
+            widths["confirm"] = 130
+        total_w = sum(widths[a] for a in visible) + self._BUTTON_GAP * (len(visible) - 1)
+        x = self._width - total_w - 16
+        for action in visible:
+            b = by_action[action]
+            w = widths[action]
+            b.rect = pygame.Rect(x, y, w, self._BUTTON_H)
+            b.visible = True
+            x += w + self._BUTTON_GAP
 
     def _point_to_pixel(self, point: Point) -> Tuple[int, int]:
         r, c = point
@@ -169,46 +237,98 @@ class GoGUI:
         pygame.draw.rect(self.screen, WINDOW_BG, pygame.Rect(0, 0, self._width, HUD_HEIGHT))
 
         if self.engine.is_over:
-            result = self.engine.result
-            assert result is not None
-            if self.ai_player is not None:
-                # PvE: frame the outcome from the human's (Black) POV.
-                human_color = Color.BLACK
-                if result.winner is None:
-                    winner_text = "Tie"
-                elif result.winner is human_color:
-                    winner_text = "You win!"
-                else:
-                    winner_text = "You lose."
-            else:
-                if result.winner is None:
-                    winner_text = "Tie"
-                else:
-                    winner_text = f"{result.winner.name.title()} wins"
-            title = (
-                f"Game over - {winner_text} "
-                f"(Black {result.black_score:g}, White {result.white_score:g})"
-            )
+            title = self._title_for_finished()
+            self._draw_score_breakdown_lines(include_dead=True)
+        elif self.engine.is_scoring:
+            title = "Scoring - click a stone to toggle dead, Confirm when done"
+            self._draw_score_breakdown_lines(include_dead=True)
         else:
             player = self.engine.current_player
             if self.ai_player is not None and player is self._ai_color:
                 title = f"{player.name.title()} (AI) to move"
             else:
                 title = f"{player.name.title()} to move"
+            if self.engine.consecutive_passes == 1:
+                title += "  (one pass already - another ends game)"
+            self._draw_playing_stats_line()
 
         title_surface = self.title_font.render(title, True, TEXT_COLOR)
-        self.screen.blit(title_surface, (16, 14))
-
-        captures_line = (
-            f"Black captures: {self.engine.captures_by(Color.BLACK)}    "
-            f"White captures: {self.engine.captures_by(Color.WHITE)}    "
-            f"Move #: {self.engine.move_number}"
-        )
-        cap_surface = self.hud_font.render(captures_line, True, MUTED_COLOR)
-        self.screen.blit(cap_surface, (16, 46))
+        self.screen.blit(title_surface, (16, 12))
 
         for button in self.buttons:
             button.draw(self.screen, self.button_font)
+
+    def _title_for_finished(self) -> str:
+        result = self.engine.result
+        assert result is not None
+        if self.ai_player is not None:
+            # PvE: frame the outcome from the human's (Black) POV.
+            human_color = Color.BLACK
+            if result.winner is None:
+                winner_text = "Tie"
+            elif result.winner is human_color:
+                winner_text = "You win!"
+            else:
+                winner_text = "You lose."
+        else:
+            if result.winner is None:
+                winner_text = "Tie"
+            else:
+                winner_text = f"{result.winner.name.title()} wins"
+        return f"Game over - {winner_text} (by {result.reason})"
+
+    def _draw_score_breakdown_lines(self, *, include_dead: bool) -> None:
+        """Render the 3-line score breakdown used in SCORING and FINISHED."""
+
+        dead = self.engine.dead_stones if include_dead else frozenset()
+        breakdown = score_breakdown(self.engine.board_grid, dead_stones=dead)
+
+        if breakdown.black_captured_dead:
+            black_line = (
+                f"Black: {breakdown.black_stones} stones + "
+                f"{breakdown.black_territory} territory "
+                f"(incl. {breakdown.black_captured_dead} dead W) = "
+                f"{breakdown.black_score:g}"
+            )
+        else:
+            black_line = (
+                f"Black: {breakdown.black_stones} stones + "
+                f"{breakdown.black_territory} territory = "
+                f"{breakdown.black_score:g}"
+            )
+        if breakdown.white_captured_dead:
+            white_line = (
+                f"White: {breakdown.white_stones} stones + "
+                f"{breakdown.white_territory} territory "
+                f"(incl. {breakdown.white_captured_dead} dead B) + "
+                f"{breakdown.komi:g} komi = {breakdown.white_score:g}"
+            )
+        else:
+            white_line = (
+                f"White: {breakdown.white_stones} stones + "
+                f"{breakdown.white_territory} territory + "
+                f"{breakdown.komi:g} komi = {breakdown.white_score:g}"
+            )
+        extras = (
+            f"Dame: {breakdown.dame}    "
+            f"Dead marked: {len(dead)}    "
+            f"Captures B/W: {self.engine.captures_by(Color.BLACK)}/"
+            f"{self.engine.captures_by(Color.WHITE)}    "
+            f"Move #: {self.engine.move_number}"
+        )
+        self.screen.blit(self.hud_font.render(black_line, True, MUTED_COLOR), (16, 42))
+        self.screen.blit(self.hud_font.render(white_line, True, MUTED_COLOR), (16, 62))
+        self.screen.blit(self.hud_font.render(extras, True, MUTED_COLOR), (16, 82))
+
+    def _draw_playing_stats_line(self) -> None:
+        captures_line = (
+            f"Black captures: {self.engine.captures_by(Color.BLACK)}    "
+            f"White captures: {self.engine.captures_by(Color.WHITE)}    "
+            f"Komi: {KOMI:g}    "
+            f"Move #: {self.engine.move_number}"
+        )
+        cap_surface = self.hud_font.render(captures_line, True, MUTED_COLOR)
+        self.screen.blit(cap_surface, (16, 44))
 
     def _draw_board(self) -> None:
         size = self.engine.size
@@ -238,6 +358,102 @@ class GoGUI:
         for point in STAR_POINTS:
             x, y = self._point_to_pixel(point)
             pygame.draw.circle(self.screen, STAR_COLOR, (x, y), 3)
+
+    def _draw_territory(self) -> None:
+        """Overlay owned empty intersections and mark dame.
+
+        Called whenever we have a score to show -- during the SCORING
+        phase (so the user can see the effect of their dead-stone
+        decisions live) and after the game is FINISHED.
+        """
+
+        dead = self.engine.dead_stones
+        breakdown = score_breakdown(self.engine.board_grid, dead_stones=dead)
+        if not breakdown.territory_owner and not breakdown.dame_points:
+            return
+
+        overlay = pygame.Surface(
+            (self._board_pixels, self._board_pixels), pygame.SRCALPHA
+        )
+        half = TERRITORY_MARK_SIZE // 2
+        for point, owner in breakdown.territory_owner.items():
+            # Skip dead-stone intersections here; they get a slightly
+            # larger marker in ``_draw_dead_overlay`` so the dead stone
+            # itself is still visible underneath.
+            if point in dead:
+                continue
+            x, y = self._point_to_pixel(point)
+            local_x = x
+            local_y = y - HUD_HEIGHT
+            rect = pygame.Rect(
+                local_x - half, local_y - half,
+                TERRITORY_MARK_SIZE, TERRITORY_MARK_SIZE,
+            )
+            fill = TERRITORY_BLACK if owner is Color.BLACK else TERRITORY_WHITE
+            pygame.draw.rect(overlay, fill, rect)
+            pygame.draw.rect(overlay, TERRITORY_BORDER, rect, width=1)
+
+        for point in breakdown.dame_points:
+            if point in dead:
+                continue
+            x, y = self._point_to_pixel(point)
+            local_x = x
+            local_y = y - HUD_HEIGHT
+            pygame.draw.circle(
+                overlay, DAME_COLOR, (local_x, local_y), DAME_DOT_RADIUS
+            )
+
+        self.screen.blit(overlay, (0, HUD_HEIGHT))
+
+    def _draw_dead_overlay(self) -> None:
+        """Render dead stones with a red X and tint the surrounding territory.
+
+        Only called when the engine is in SCORING or FINISHED with a
+        non-empty dead-stone set. The X sits on top of the (still-drawn)
+        stone so the user can see which piece they've marked.
+        """
+
+        dead = self.engine.dead_stones
+        if not dead:
+            return
+
+        breakdown = score_breakdown(self.engine.board_grid, dead_stones=dead)
+        overlay = pygame.Surface(
+            (self._board_pixels, self._board_pixels), pygame.SRCALPHA
+        )
+        half = STONE_RADIUS
+
+        for point in dead:
+            x, y = self._point_to_pixel(point)
+            local_x = x
+            local_y = y - HUD_HEIGHT
+            owner = breakdown.territory_owner.get(point)
+            # Paint a faint owner-colored square so the dead stone reads
+            # as territory belonging to the surrounding color.
+            if owner is not None:
+                fill = TERRITORY_BLACK if owner is Color.BLACK else TERRITORY_WHITE
+                rect = pygame.Rect(
+                    local_x - half, local_y - half, STONE_RADIUS * 2, STONE_RADIUS * 2
+                )
+                pygame.draw.rect(overlay, fill, rect)
+            # Red X across the stone.
+            offset = STONE_RADIUS - 6
+            pygame.draw.line(
+                overlay,
+                (220, 40, 40, 230),
+                (local_x - offset, local_y - offset),
+                (local_x + offset, local_y + offset),
+                3,
+            )
+            pygame.draw.line(
+                overlay,
+                (220, 40, 40, 230),
+                (local_x - offset, local_y + offset),
+                (local_x + offset, local_y - offset),
+                3,
+            )
+
+        self.screen.blit(overlay, (0, HUD_HEIGHT))
 
     def _draw_stones(self) -> None:
         board = self.engine.board_state()
@@ -271,9 +487,14 @@ class GoGUI:
 
     def _render(self) -> None:
         self.screen.fill(WINDOW_BG)
+        self._layout_buttons()
         self._draw_hud()
         self._draw_board()
+        if self.engine.is_scoring or self.engine.is_over:
+            self._draw_territory()
         self._draw_stones()
+        if self.engine.is_scoring or self.engine.is_over:
+            self._draw_dead_overlay()
         self._draw_banner()
         pygame.display.flip()
 
@@ -288,12 +509,26 @@ class GoGUI:
             return
         if self._ai_thinking:
             return
+
+        point = self._pixel_to_point(pos[0], pos[1])
+        if point is None:
+            return
+
+        if self.engine.is_scoring:
+            # Toggle the group of stones under the click dead/alive.
+            r, c = point
+            if self.engine.board_grid[r][c] is Color.EMPTY:
+                return
+            self.engine.toggle_group_dead(point)
+            if point in self.engine.dead_stones:
+                self._set_banner("Marked dead")
+            else:
+                self._set_banner("Marked alive")
+            return
+
         if self.ai_player is not None and self.engine.current_player is self._ai_color:
             # Shouldn't normally happen (AI would already be thinking)
             # but guards against a stale click sneaking in.
-            return
-        point = self._pixel_to_point(pos[0], pos[1])
-        if point is None:
             return
         result = self.engine.play(point)
         if not result.legal:
@@ -305,16 +540,38 @@ class GoGUI:
 
     def _handle_button(self, action: str) -> None:
         if action == "pass":
+            if self.engine.is_over or self.engine.is_scoring or self._ai_thinking:
+                return
+            passer = self.engine.current_player
+            before_scoring = self.engine.is_scoring
+            self.engine.pass_move()
+            if self.engine.is_scoring and not before_scoring:
+                self._set_banner("Two passes - review dead stones, then Confirm Score")
+            else:
+                self._set_banner(f"{passer.name.title()} passed")
+            self._maybe_start_ai_turn()
+        elif action == "resign":
             if self.engine.is_over or self._ai_thinking:
                 return
-            loser = self.engine.current_player
-            self.engine.pass_turn()
-            self._set_banner(f"{loser.name.title()} passed - concedes game")
+            resigner = self.engine.current_player
+            self.engine.resign()
+            self._set_banner(f"{resigner.name.title()} resigned")
         elif action == "score":
-            if self.engine.is_over or self._ai_thinking:
+            if self.engine.is_over or self.engine.is_scoring or self._ai_thinking:
                 return
-            self.engine.finish_by_score()
+            self.engine.enter_scoring()
+            self._set_banner("Entered scoring - review dead stones, then Confirm Score")
+        elif action == "confirm":
+            if self.engine.is_over or not self.engine.is_scoring or self._ai_thinking:
+                return
+            self.engine.confirm_score()
             self._set_banner("Game scored")
+        elif action == "resume":
+            if self.engine.is_over or not self.engine.is_scoring or self._ai_thinking:
+                return
+            self.engine.cancel_scoring()
+            self._set_banner("Resumed play")
+            self._maybe_start_ai_turn()
         elif action == "new":
             with self._ai_lock:
                 self._game_id += 1
@@ -332,7 +589,7 @@ class GoGUI:
 
         if self.ai_player is None:
             return
-        if self.engine.is_over:
+        if self.engine.is_over or self.engine.is_scoring:
             return
         if self.engine.current_player is not self._ai_color:
             return
@@ -385,13 +642,14 @@ class GoGUI:
             # AI had nothing to play. Two sub-cases:
             #   (a) engine is already over (someone resigned, scored, etc.)
             #   (b) AI has no legal board move and refuses to pass
-            # In (b) we end the game by area scoring so the GUI never
-            # gets stuck waiting on a phantom AI turn. The human picks
-            # this up from the game-over HUD + banner.
-            if not self.engine.is_over:
-                self.engine.finish_by_score()
+            # In (b) we enter the scoring phase so the human can review
+            # dead stones and confirm. The GUI never hangs waiting on a
+            # phantom AI turn.
+            if not self.engine.is_over and not self.engine.is_scoring:
+                self.engine.enter_scoring()
                 self._set_banner(
-                    "AI has no legal move - game scored.", duration_ms=4000
+                    "AI has no legal move - review dead stones, then Confirm Score",
+                    duration_ms=4000,
                 )
             return
         if self.engine.is_over:
@@ -423,9 +681,17 @@ class GoGUI:
 
             self._drain_ai_pending()
 
+            # Button positions are recomputed in _render each frame, so
+            # we need to lay them out once up-front so hover + click
+            # hit-testing use the current-phase rects.
+            self._layout_buttons()
             mouse_pos = pygame.mouse.get_pos()
             for button in self.buttons:
-                button.hover = button.rect.collidepoint(mouse_pos)
+                button.hover = (
+                    button.visible
+                    and button.enabled
+                    and button.rect.collidepoint(mouse_pos)
+                )
 
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -433,6 +699,8 @@ class GoGUI:
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     clicked_button = None
                     for button in self.buttons:
+                        if not (button.visible and button.enabled):
+                            continue
                         if button.rect.collidepoint(event.pos):
                             clicked_button = button
                             break
@@ -442,11 +710,21 @@ class GoGUI:
                         self._handle_board_click(event.pos)
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
-                        running = False
+                        # Esc cancels scoring back to PLAYING; otherwise
+                        # it quits the window as before.
+                        if self.engine.is_scoring:
+                            self._handle_button("resume")
+                        else:
+                            running = False
+                    elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                        if self.engine.is_scoring:
+                            self._handle_button("confirm")
                     elif event.key == pygame.K_n:
                         self._handle_button("new")
                     elif event.key == pygame.K_p:
                         self._handle_button("pass")
+                    elif event.key == pygame.K_r:
+                        self._handle_button("resign")
                     elif event.key == pygame.K_s:
                         self._handle_button("score")
 

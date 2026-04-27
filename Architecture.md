@@ -36,11 +36,11 @@ flowchart LR
 Three runtime components communicate exclusively through on-disk
 artifacts:
 
-| Producer             | Artifact                              | Consumer       |
-| -------------------- | ------------------------------------- | -------------- |
-| Self-play workers    | `replay/game_*.pkl`                   | Trainer        |
-| Trainer              | `checkpoints/latest.pt` + numbered    | Self-play      |
-| Trainer              | `checkpoints/latest.json` (meta)      | Self-play      |
+| Producer          | Artifact                           | Consumer  |
+| ----------------- | ---------------------------------- | --------- |
+| Self-play workers | `replay/game_*.pkl`                | Trainer   |
+| Trainer           | `checkpoints/latest.pt` + numbered | Self-play |
+| Trainer           | `checkpoints/latest.json` (meta)   | Self-play |
 
 This decoupling is the point of the design: a worker never blocks on the
 trainer, the trainer never blocks on a worker, and they can live on
@@ -187,11 +187,11 @@ catches the file mid-write never loads a torn blob.
 
 Three CLIs live in [`scripts/`](scripts):
 
-| File                                       | Purpose                                                                 |
-| ------------------------------------------ | ----------------------------------------------------------------------- |
-| [`scripts/automated_training.py`](scripts/automated_training.py) | Parallel self-play + trainer on one box; shared-memory weight broadcast. |
-| [`scripts/self_play.py`](scripts/self_play.py) | Long-running self-play-only worker; consumes checkpoints, produces replay files. |
-| [`scripts/train.py`](scripts/train.py)     | Long-running trainer-only; consumes replay files, produces checkpoints. |
+| File                                                             | Purpose                                                                          |
+| ---------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| [`scripts/automated_training.py`](scripts/automated_training.py) | Parallel self-play + trainer on one box; shared-memory weight broadcast.         |
+| [`scripts/self_play.py`](scripts/self_play.py)                   | Long-running self-play-only worker; consumes checkpoints, produces replay files. |
+| [`scripts/train.py`](scripts/train.py)                           | Long-running trainer-only; consumes replay files, produces checkpoints.          |
 
 For single-box runs, `automated_training.py` is the recommended entry
 point. It fans self-play out across `--num-workers` processes that all
