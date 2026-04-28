@@ -31,10 +31,17 @@ new game, **Esc** = quit. The AI runs 100 MCTS simulations per move
 (change `DEFAULT_SIMULATIONS` in [`go_game/menu.py`](go_game/menu.py) to
 taste).
 
-Checkpoints are gitignored. If training is on another machine:
+Checkpoints are gitignored. If training is on another machine, copy only the
+current playable checkpoint instead of the full `step_*.pt` history:
 
 ```bash
-rsync -av <training-host>:~/GuuGo/checkpoints ./
+mkdir -p checkpoints
+rsync -avz --progress \
+  --include='latest.pt' \
+  --include='latest.json' \
+  --exclude='*' \
+  <training-host>:~/GuuGo/checkpoints/ \
+  ./checkpoints/
 ```
 
 ### Train a network (GPU box)
