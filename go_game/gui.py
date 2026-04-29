@@ -34,6 +34,7 @@ HUD_HEIGHT = 130
 BANNER_HEIGHT = 40
 TERRITORY_MARK_SIZE = 14
 DAME_DOT_RADIUS = 4
+COORDINATE_LABEL_OFFSET = 26
 
 BOARD_BG = (221, 176, 107)
 WINDOW_BG = (245, 238, 224)
@@ -125,6 +126,7 @@ class GoGUI:
         self.hud_font = pygame.font.SysFont("helvetica", 15)
         self.button_font = pygame.font.SysFont("helvetica", 14, bold=True)
         self.banner_font = pygame.font.SysFont("helvetica", 16, bold=True)
+        self.coordinate_font = pygame.font.SysFont("helvetica", 15, bold=True)
 
         self.buttons = self._build_buttons()
         self._banner_text: Optional[str] = None
@@ -358,6 +360,33 @@ class GoGUI:
         for point in STAR_POINTS:
             x, y = self._point_to_pixel(point)
             pygame.draw.circle(self.screen, STAR_COLOR, (x, y), 3)
+        self._draw_coordinates()
+
+    def _draw_coordinates(self) -> None:
+        size = self.engine.size
+        bottom_y = HUD_HEIGHT + BOARD_MARGIN + CELL_SIZE * (size - 1)
+
+        for i in range(size):
+            x = BOARD_MARGIN + i * CELL_SIZE
+            y = HUD_HEIGHT + BOARD_MARGIN + i * CELL_SIZE
+
+            col_label = chr(ord("A") + i)
+            col_surface = self.coordinate_font.render(col_label, True, TEXT_COLOR)
+            self.screen.blit(
+                col_surface,
+                col_surface.get_rect(
+                    center=(x, bottom_y + COORDINATE_LABEL_OFFSET)
+                ),
+            )
+
+            row_label = str(size - i)
+            row_surface = self.coordinate_font.render(row_label, True, TEXT_COLOR)
+            self.screen.blit(
+                row_surface,
+                row_surface.get_rect(
+                    center=(BOARD_MARGIN - COORDINATE_LABEL_OFFSET, y)
+                ),
+            )
 
     def _draw_territory(self) -> None:
         """Overlay owned empty intersections and mark dame.
